@@ -28,13 +28,15 @@ def remove_files(files):
         os.remove(f)
 
 
-def cpuflags():
+def cpuflags(pcipassthrough=False):
     cpu_template = "cpu-default.xml"
     cpu_info = readfile("/proc/cpuinfo")
     if re.search("^CPU architecture.* 8", cpu_info, re.MULTILINE):
         cpu_template = "cpu-arm64.xml"
     elif re.search("^vendor_id.*GenuineIntel", cpu_info, re.MULTILINE):
         cpu_template = "cpu-intel.xml"
+        if pcipassthrough:
+            cpu_template = "cpu-intel-pcipassthrough.xml"
     elif re.search("^vendor_id.*AuthenticAMD", cpu_info, re.MULTILINE):
         cpu_template = "cpu-amd.xml"
     elif re.search("^vendor_id.*IBM/S390", cpu_info, re.MULTILINE):
@@ -97,10 +99,15 @@ def get_console_type():
     return 'serial'
 
 
-def get_memballoon_type():
+def get_memballoon_type(pcipassthrough=False):
     if 's390x' in get_machine_arch():
         return """    <memballoon model='virtio' autodeflate='on'>
     </memballoon>"""
+
+    if pcipassthrough:
+        return """    <memballoon model='virtio' autodeflate='on'>
+          <address type='pci' bus='0x02' slot='0x0'/>
+        </memballoon>"""
 
     return """    <memballoon model='virtio' autodeflate='on'>
       <address type='pci' bus='0x02' slot='0x01'/>
@@ -116,13 +123,16 @@ def get_serial_device():
     </serial>"""
 
 
-def get_mainnic_address(index):
+def get_mainnic_address(index, pcipassthrough=False):
     mainnicaddress = "<address type='pci' bus='0x01' slot='%s'/>" % \
         (hex(index + 0x1))
-    if 's390x' in get_machine_arch():
+    if 's390x' in get_machine_arch() and not pcipassthrough:
         mainnicaddress = "<address type='ccw' cssid='0xfe' ssid='0x0' " \
             "devno='%s'/>" % \
             (hex(index + 0x1))
+    if pcipassthrough:
+        mainnicaddress = "<address type='pci' bus='0x01' slot='%s'/>" % \
+            (hex(index + 0x0))
     return mainnicaddress
 
 
@@ -186,7 +196,7 @@ def net_interfaces_config(args, nicmodel):
         nicdriver = '<driver name="vhost" queues="2"/>'
 
     for index, mac in enumerate(args.macaddress):
-        mainnicaddress = get_mainnic_address(index)
+        mainnicaddress = get_mainnic_address(index, args.pcipassthrough)
         values = dict(
             cloud=args.cloud,
             nodecounter=args.nodecounter,
@@ -233,11 +243,13 @@ def compute_config(args, cpu_flags=cpuflags()):
                           it.product(string.ascii_lowercase,
                                      string.ascii_lowercase))
 
+    allbuses = it.chain(range(3, 256))
+
     configopts = {
         'nicmodel': 'e1000',
         'emulator': args.emulator,
         'vdisk_dir': args.vdiskdir,
-        'memballoon': get_memballoon_type(),
+        'memballoon': get_memballoon_type(args.pcipassthrough),
     }
 
     if hypervisor_has_virtio(libvirt_type):
@@ -247,6 +259,8 @@ def compute_config(args, cpu_flags=cpuflags()):
         if 's390x' in get_machine_arch():
             target_address = \
                 "<address type='ccw' cssid='0xfe' ssid='0x0' devno='{0}'/>"
+        elif args.pcipassthrough:
+            target_address = "<address type='pci' slot='{0}' bus='{1}'/>"
         else:
             target_address = "<address type='pci' slot='{0}'/>"
     else:
@@ -257,7 +271,7 @@ def compute_config(args, cpu_flags=cpuflags()):
             "bus='{0}' target='0' unit='0'/>"
 
     # override nic model for ironic setups
-    if args.ironicnic >= 0:
+    if args.ironicnic >= 0 and not args.pcipassthrough:
         configopts['nicmodel'] = 'e1000'
 
     controller_raid_volumes = args.controller_raid_volumes
@@ -271,6 +285,11 @@ def compute_config(args, cpu_flags=cpuflags()):
     # a valid serial is defined in libvirt-1.2.18/src/qemu/qemu_command.c:
     serialcloud = re.sub("[^A-Za-z0-9-_]", "_", args.cloud)
     for i in range(1, controller_raid_volumes):
+        if args.pcipassthrough:
+            configopts['target_address'] = target_address.format('0x00',
+                hex(next(allbuses)))
+        else:
+            configopts['target_address'] = target_address.format(hex(0x10 + i))
         raid_template = string.Template(
             readfile(os.path.join(TEMPLATE_DIR, "extra-volume.xml")))
         raidvolume += "\n" + raid_template.substitute(merge_dicts({
@@ -284,12 +303,16 @@ def compute_config(args, cpu_flags=cpuflags()):
                 args.nodecounter,
                 i),
             'target_dev': targetdevprefix + ''.join(next(alldevices)),
-            'target_address': target_address.format(hex(0x10 + i)),
         }, configopts))
 
     cephvolume = ""
     if args.cephvolumenumber and args.cephvolumenumber > 0:
         for i in range(1, args.cephvolumenumber + 1):
+            if args.pcipassthrough:
+                configopts['target_address'] = target_address.format('0x00',
+                    hex(next(allbuses)))
+            else:
+                configopts['target_address'] = target_address.format(hex(0x16 + i))
             ceph_template = string.Template(
                 readfile(os.path.join(TEMPLATE_DIR, "extra-volume.xml")))
             cephvolume += "\n" + ceph_template.substitute(merge_dicts({
@@ -302,12 +325,16 @@ def compute_config(args, cpu_flags=cpuflags()):
                     args.cloud,
                     args.nodecounter,
                     i),
-                'target_dev': targetdevprefix + ''.join(next(alldevices)),
-                'target_address': target_address.format(hex(0x16 + i)),
+                'target_dev': targetdevprefix + ''.join(next(alldevices))
             }, configopts))
 
     drbdvolume = ""
     if args.drbdserial:
+        if args.pcipassthrough:
+            configopts['target_address'] = target_address.format('0x00',
+                hex(next(allbuses)))
+        else:
+            configopts['target_address'] = target_address.format(hex(0x1f))
         drbd_template = string.Template(
             readfile(os.path.join(TEMPLATE_DIR, "extra-volume.xml")))
         drbdvolume = drbd_template.substitute(merge_dicts({
@@ -316,11 +343,34 @@ def compute_config(args, cpu_flags=cpuflags()):
                 args.vdiskdir,
                 args.cloud,
                 args.nodecounter),
-            'target_dev': targetdevprefix + ''.join(next(alldevices)),
-            'target_address': target_address.format('0x1f')},
+            'target_dev': targetdevprefix + ''.join(next(alldevices))},
             configopts))
 
-    if args.ipmi:
+    machine = get_default_machine(args.emulator)
+    extravolume = ""
+    if args.pcipassthrough:
+        configopts['target_address'] = target_address.format('0x00',
+            hex(next(allbuses)))
+        volume_template = string.Template(
+            readfile(os.path.join(TEMPLATE_DIR, "extra-volume.xml")))
+        extravolume = volume_template.substitute(merge_dicts({
+            'volume_serial': "{0}-node{1}-extra".format(
+                args.cloud,
+                args.nodecounter),
+            'source_dev': "{0}/{1}.node{2}-extra".format(
+                args.vdiskdir,
+                args.cloud,
+                args.nodecounter),
+            'target_dev': targetdevprefix + ''.join(next(alldevices)),
+            }, configopts))
+        iommudevice = readfile(os.path.join(TEMPLATE_DIR, 'iommu-device-default.xml'))
+        machine = "q35"
+        # pci address for the main drive, i.e., sda, vda
+        target_address_maindisk = target_address.format('0x0a', '0x00')
+    else:
+        target_address_maindisk = target_address.format('0x0a')
+
+    if args.ipmi and not args.pcipassthrough:
         values = dict(
           nodecounter=args.nodecounter
         )
@@ -329,7 +379,7 @@ def compute_config(args, cpu_flags=cpuflags()):
     else:
         ipmi_config = ''
 
-    if not hypervisor_has_virtio(libvirt_type):
+    if not hypervisor_has_virtio(libvirt_type) and not args.pcipassthrough:
         target_address = target_address.format('0')
         # map virtio addr to ide:
         raidvolume = raidvolume.replace("bus='0x17'", "bus='1'")
@@ -342,20 +392,22 @@ def compute_config(args, cpu_flags=cpuflags()):
         nodememory=nodememory,
         vcpus=args.vcpus,
         march=get_machine_arch(),
-        machine=get_default_machine(args.emulator),
+        machine=machine,
         osloader=get_os_loader(firmware_type=args.firmwaretype),
         cpuflags=cpu_flags,
         consoletype=get_console_type(),
         raidvolume=raidvolume,
         cephvolume=cephvolume,
         drbdvolume=drbdvolume,
+        extravolume=extravolume,
+        iommudevice=iommudevice,
         nics=net_interfaces_config(args, configopts["nicmodel"]),
         maindiskaddress=get_maindisk_address(),
         videodevices=get_video_devices(),
         target_dev=targetdevprefix + 'a',
         serialdevice=get_serial_device(),
         ipmidevice=ipmi_config,
-        target_address=target_address.format('0x0a'),
+        target_address_maindisk=target_address_maindisk,
         bootorder=args.bootorder,
         local_repository_mount=localrepomount)
 

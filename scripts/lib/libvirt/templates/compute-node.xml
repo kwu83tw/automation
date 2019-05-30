@@ -19,12 +19,14 @@ $cpuflags
       <driver name='qemu' type='raw' cache='unsafe'/>
       <source dev='$vdisk_dir/$cloud.node$nodecounter'/>
       <target dev='$target_dev' bus='$target_bus'/>
-      $target_address
+      $target_address_maindisk
       <boot order='$bootorder'/>
     </disk>
 $raidvolume
 $cephvolume
 $drbdvolume
+$extravolume
+$iommudevice
 $nics
 $serialdevice
     <console type='pty'>
