@@ -57,10 +57,12 @@ fi
 
 # global variables that are set within this script
 novacontroller=
+novacompute_kvm=
 horizonserver=
 horizonservice=
 manila_service_vm_uuid=
 manila_tenant_vm_ip=
+pci_passthru_instance_name=
 clusternodesdrbd=
 clusternodesdata=
 clusternodesnetwork=
@@ -2664,6 +2666,16 @@ function custom_configuration
                 proposal_set_value nova default "['deployment']['nova']['elements']['nova-compute-${libvirt_type}']" "[]"
                 proposal_set_value nova default "['deployment']['nova']['elements']['nova-compute-kvm']" "[]"
             fi
+            if iscloudver 9plus && [[ $want_pci_passthrough = 1 ]] ; then
+                # add PciPassthroughFilter to enabled_filters for scheduler
+                proposal_set_value nova default "['attributes']['nova']['scheduler']['enabled_filters']" \
+"'RetryFilter,AvailabilityZoneFilter,ComputeFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter,ServerGroupAntiAffinityFilter,ServerGroupAffinityFilter,SameHostFilter,DifferentHostFilter,PciPassthroughFilter'"
+#                local has_itxt=$(proposal_get_value nova default "['attributes']['nova']['itxt_instance']")
+#                if [ -z "$has_itxt" ] || [ "$has_itxt" == "none" ] ; then
+#                    proposal_set_value nova default "['attributes']['nova']['scheduler']['enabled_filters']" \
+#"'RetryFilter,AvailabilityZoneFilter,ComputeFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter,ServerGroupAntiAffinityFilter,ServerGroupAffinityFilter,SameHostFilter,DifferentHostFilter,PciPassthroughFilter'"
+#                fi
+            fi
         ;;
         horizon|nova_dashboard)
             [[ $want_ldap = 1 ]] && iscloudver 7plus && proposal_set_value $proposal default "['attributes']['$proposal']['multi_domain_support']" "true"
@@ -3314,7 +3326,28 @@ function onadmin_proposal
         safely oncontroller check_crm_failcounts
     done
 
+    verify_pci_passthru
+
     set_dashboard_alias
+}
+
+function verify_pci_passthru()
+{
+    if iscloudver 9plus && [[ $want_pci_passthrough = 1 ]] ; then
+        # Place nova configuration to verify pci_passthru
+        get_novacontroller
+        safely oncontroller create_pci_passthru_conf
+        get_novacompute_kvm
+        safely oncompute create_pci_passthru_conf
+        safely oncompute load_vfio_module_onboot
+        safely oncompute bind_vfio_module_onboot
+        # spin up vm and pass device from compute host to vm to verify pci
+        # passthru functionality.
+#        get_novacontroller
+#        safely oncontroller setup_pci_passthru_vm
+#        get_novacompute_kvm
+#        safely oncompute parse_vm_xml
+    fi
 }
 
 function set_node_alias
@@ -3415,6 +3448,15 @@ function get_novacontroller
                     puts j['deployment']['nova']\
                         ['elements']['nova-controller']"`
     novacontroller=`resolve_element_to_hostname "$element"`
+}
+
+function get_novacompute_kvm
+{
+    local element=`crowbar nova proposal show default | \
+        rubyjsonparse "
+                    puts j['deployment']['nova']\
+                        ['elements']['nova-compute-kvm']"`
+    novacompute_kvm=`resolve_element_to_hostname "$element"`
 }
 
 function get_horizon
@@ -3858,6 +3900,98 @@ function oncontroller_heat_image_setup()
                     $image_name | tee glance.out
         fi
     fi
+}
+
+function oncompute_parse_vm_xml()
+{
+    virsh list --all | grep $pci_passthru_instance_name
+    [ $? != 0 ] && complain 53 "failed to find pci-passthru-instance"
+
+    # verify node xml to see if it has pci passthru section which has the
+    # specific address passing from compute host
+    virsh dumpxml $pci-passthru-instanc | grep -E "<hostdev" -A 7 | grep "0x1d"
+    [ $? != 0 ] && complain 63 "failed to find pci-passthru block in node xml"
+}
+
+function oncontroller_setup_pci_passthru_vm()
+{
+    local cirros_image_url=$imageserver_url/$arch/openstack/cirros-0.4.0-x86_64-disk.img
+    local cirros_image_name=cirros-0.4.0-x86_64-disk.img
+    local cirros_image_params="--disk-format qcow2 --property hypervisor_type=kvm"
+
+    local sec_group="pci-passthru"
+    local local_image_path=""
+    if [ -n "${localreposdir_target}" ] ; then
+        local_image_path=$localreposdir_target/images/$arch/openstack/$cirros_image_name
+    fi
+
+    if [ -n "${local_image_path}" -a -f "${local_image_path}" ] ; then
+        cirros_image_name=$local_image_path
+    else
+        local ret=$(wget -N --progress=dot:mega "$cirros_image_url" 2>&1 >/dev/null)
+        if [[ $ret =~ "200 OK" ]]; then
+            echo $ret
+        elif [[ $ret =~ "Not Found" ]]; then
+            complain 73 "cirros image not found: $ret"
+        else
+            complain 74 "failed to retrieve cirros image: $ret"
+        fi
+    fi
+
+    . .openrc
+
+    # using list subcommand because show requires an ID
+    if ! openstack image list --format value -c Name | grep -q "^cirros-0.4.0-x86_64-disk$"; then
+        openstack image create --file $cirros_image_name \
+            $cirros_image_params --container-format bare --public \
+            cirros-0.4.0-x86_64-disk
+    fi
+
+    # create flavor with pci-passthru property so that the vm using this flavor
+    # will aquire the pci device passing from the host (compute)
+    openstack flavor create --id 200 --ram 512 --ephemeral 0 \
+        --vcpus 1 --property "pci_passthrough:alias"="a1:1" \
+        pci-passthru-flavor
+
+    if iscloudver 9plus && ! openstack security group show $sec_group 2>/dev/null ; then
+        openstack security group create --description "$sec_group description" $sec_group
+        openstack security group rule create --protocol icmp $sec_group
+        openstack security group rule create --protocol tcp --dst-port 22 $sec_group
+    fi
+
+    fixed_net_id=`neutron net-show fixed -f value -c id`
+    timeout 10m openstack server create --flavor 200 \
+        --image cirros-0.4.0-x86_64-disk \
+        --security-group $sec_group \
+        --nic net-id=$fixed_net_id pci-passthru-instance
+
+    [ $? != 0 ] && complain 43 "nova boot pci-passthru-instance failed"
+
+    # Check status of the vm
+    wait_for 300 1 "openstack server show -c status -f value pci-passthru-instance | grep '^ACTIVE$'" \
+        "pci passthru VM booted and is in ACTIVE state" \
+        "echo \"ERROR: pci passthru VM is not in ACTIVE state.\""
+
+    # Get instance name (e.g.,instance-00000001)
+    pci_passthru_instance_name = $(openstack server show -c OS-EXT-SRV-ATTR:instance_name -f value pci-passthru-instance)
+
+#    # Create a floating IP for the instance and add it to the VM
+#    oscclient_ver=`rpm -q --queryformat '%{VERSION}' python-openstackclient`
+#    if [ ${oscclient_ver:0:1} -ge 3 ]; then
+#        # >= Newton
+#        pci_passthru_vm_ip=`openstack floating ip create floating -f value -c floating_ip_address`
+#        openstack server add floating ip pci-passthru-instance $pci_passthru_vm_ip
+#    else
+#        pci_passthru_vm_ip=`openstack ip floating create floating -f value -c ip`
+#        openstack ip floating add $pci_passthru_vm_ip pci-passthru-instance
+#    fi
+#
+#    [ $? != 0 ] && complain 44 "adding a floating ip to the pci passthru VM failed"
+#
+#    # check that the service VM is pingable.
+#    wait_for 300 1 "nc -w 1 -z $pci_passthru_vm_ip 22" \
+#        "pci passthru VM booted and ssh port open" \
+#        "echo \"ERROR: pci passthru VM not listening on ssh port.\""
 }
 
 function oncontroller_manila_generic_driver_setup()
@@ -4476,6 +4610,60 @@ function oncontroller
 {
     local func=$1 ; shift
     run_on "$novacontroller" "oncontroller_$func $@"
+}
+
+function oncompute
+{
+    local func=$1 ; shift
+    run_on "$novacompute_kvm" "oncompute_$func $@"
+}
+
+function oncompute_load_vfio_module_onboot
+{
+    # vfio-pci module is not loaded by default, however, we need it to bind to
+    # our candidate device to verify pci passthru
+    cat > /etc/modules-load.d/pci-passthru.conf <<EOF
+vfio_pci
+EOF
+    modprobe vfio-pci
+}
+
+function oncompute_bind_vfio_module_onboot
+{
+    # We need to bind vfio-pci to our candidate device to verify pci passthru
+    cat > /etc/udev/rules.d/99-pci-passthru.rules <<EOF
+KERNELS=="0000:00:1d.0", SUBSYSTEMS=="pci", ATTRS{device}=="0x1001", ATTRS{vendor}=="0x1af4", \
+RUN+="/bin/bash -c 'echo  0000:00:1d.0 > /sys/bus/pci/devices/0000:00:1d.0/driver/unbind'", \
+RUN+="/bin/bash -c 'echo 1af4 1001 > /sys/bus/pci/drivers/vfio-pci/new_id'"
+EOF
+}
+
+function oncompute_create_pci_passthru_conf
+{
+    # drop new configuration file under /etc/nova/nova.conf.d/ on compute
+    # [pci]
+    # passthrough_whitelist = { "address": "0000:41:00.0" }
+    # alias = { "vendor_id":"1af4", "product_id":"1001", "device_type":"type-PCI", "name":"a1" }
+    cat > /etc/nova/nova.conf.d/200-nova-pci-passthru.conf <<EOF
+[pci]
+passthrough_whitelist = { "address": "0000:00:1d.0" }
+alias = { "vendor_id":"1af4", "product_id":"1001", "device_type":"type-PCI", "name":"a1" }
+EOF
+    # Make the changes effective
+    systemctl restart openstack-nova-compute.service
+}
+
+function oncontroller_create_pci_passthru_conf
+{
+    # drop new configuration file under /etc/nova/nova.conf.d/ on controller
+    # [pci]
+    # alias = { "vendor_id":"1af4", "product_id":"1001", "device_type":"type-PCI", "name":"a1" }
+    cat > /etc/nova/nova.conf.d/200-nova-pci-passthru.conf <<EOF
+[pci]
+alias = { "vendor_id":"1af4", "product_id":"1001", "device_type":"type-PCI", "name":"a1" }
+EOF
+    # Make the changes effective
+    systemctl restart openstack-nova-api.service
 }
 
 function install_suse_ca

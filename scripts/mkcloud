@@ -1455,6 +1455,8 @@ Optional
         If set, does not use the --insecure flag in openstack CLI commands.
     want_monasca_tsdb (Cloud9+ only)
         Allows setting time-series DB used for Monasca [influxdb|cassandra].
+    want_pci_passthrough (default=0)
+        Deploy node with an extra disk to test pci passthrough. Cloud9+ only.
     want_ipv6 (Currently in development)
         Prepare crowbar to use a full IPv6 single stack control plane. Enabling will also set
         the firmware_type to UEFI as it's required to netboot nodes over IPv6.

@@ -401,6 +401,11 @@
           default: '1'
           description: set to 0 to not deploy aodh
 
+      - string:
+          name: want_pci_passthrough
+          default:
+          description: set to 1 to deploy extra disk to test pci passthrough
+
       ################################################
       # misc
 
